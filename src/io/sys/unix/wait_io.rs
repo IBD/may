@@ -14,11 +14,25 @@ use crate::yield_now::yield_with_io;
 
 pub struct RawIoBlock<'a> {
     io_data: &'a io_impl::IoData,
+    #[cfg(feature = "io_timeout")]
+    timeout: Option<std::time::Duration>,
 }
 
 impl<'a> RawIoBlock<'a> {
     fn new(io_data: &'a io_impl::IoData) -> Self {
-        RawIoBlock { io_data }
+        RawIoBlock {
+            io_data,
+            #[cfg(feature = "io_timeout")]
+            timeout: None,
+        }
+    }
+
+    #[cfg(feature = "io_timeout")]
+    fn new_timeout(io_data: &'a io_impl::IoData, dur: std::time::Duration) -> Self {
+        RawIoBlock {
+            io_data,
+            timeout: Some(dur),
+        }
     }
 }
 
@@ -27,6 +41,14 @@ impl EventSource for RawIoBlock<'_> {
         #[cfg(feature = "io_cancel")]
         let handle = co_get_handle(&co);
         let io_data = self.io_data;
+        
+        #[cfg(feature = "io_timeout")]
+        if let Some(dur) = self.timeout {
+            crate::scheduler::get_scheduler()
+                .get_selector()
+                .add_io_timer(io_data, dur);
+        }
+
         io_data.co.store(co);
         // there is event, re-run the coroutine
         if io_data.io_flag.load(Ordering::Acquire) != 0 {
@@ -75,6 +97,8 @@ pub trait WaitIo {
     fn reset_io(&self) -> usize;
     /// block on read/write event, return events flags
     fn wait_io(&self) -> usize;
+    /// block on read/write event with timeout, return events flags
+    fn wait_io_timeout(&self, timeout: std::time::Duration) -> usize;
     /// wake up the coroutine that is waiting for io
     fn waker(&self) -> WaitIoWaker;
 }
@@ -92,6 +116,19 @@ impl<T: io_impl::AsIoData> WaitIo for T {
         }
         let blocker = RawIoBlock::new(self.as_io_data());
         yield_with_io(&blocker, true);
+        io_data.reset()
+    }
+
+    fn wait_io_timeout(&self, timeout: std::time::Duration) -> usize {
+        let io_data = self.as_io_data();
+        // when io flag is set we do nothing
+        if io_data.io_flag.load(Ordering::Relaxed) != 0 {
+            return io_data.reset();
+        }
+        let blocker = RawIoBlock::new_timeout(io_data, timeout);
+        yield_with_io(&blocker, true);
+        // consume the para to clear any TimedOut or Cancel errors
+        let _ = crate::yield_now::get_co_para();
         io_data.reset()
     }
 
